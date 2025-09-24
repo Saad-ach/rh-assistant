@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.so
+*.egg-info/
+.eggs/
+build/
+dist/
+.site-packages/
+
+# Virtual environments
+.env
+.env.*
+venv/
+.venv/
+ENV/
+
+# Tooling caches
+.pytest_cache/
+.mypy_cache/
+.coverage*
+.coverage/
+htmlcov/
+.ipynb_checkpoints/
+*.cache
+
+# Editors/IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+ehthumbs.db
+$RECYCLE.BIN/
+
+# Node (if any frontend)
+node_modules/
+npm-debug.log*
+yarn-error.log*
+.pnpm-store/
+
+# Databases and local data
+*.sqlite3
+*.db
+
