@@ -19,6 +19,14 @@ class ChromaVectorizer:
             ids=[doc_id]
         )
 
+    def add_document_with_embedding(self, doc_id: str, document: str, metadata: dict, embedding: list[float]):
+        self.collection.upsert(
+            documents=[document],
+            metadatas=[metadata],
+            ids=[doc_id],
+            embeddings=[embedding],
+        )
+
     def search_documents(self, query: str, n_results: int = 5):
         results = self.collection.query(
             query_texts=[query],

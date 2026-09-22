@@ -6,7 +6,12 @@ from passlib.context import CryptContext
 
 from app.core.config import settings
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+# Prefer a widely supported algorithm for local/dev setups, while keeping
+# backward compatibility with any older bcrypt hashes already in storage.
+pwd_context = CryptContext(
+    schemes=["pbkdf2_sha256", "bcrypt"],
+    deprecated="auto",
+)
 
 
 def create_access_token(data: dict, expires_delta: timedelta | None = None):
@@ -23,6 +28,8 @@ def create_access_token(data: dict, expires_delta: timedelta | None = None):
 def verify_token(token: str, credentials_exception):
     try:
         payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+        if not payload.get("sub") or payload.get("type") != "access":
+            raise credentials_exception
         return payload
     except JWTError:
         raise credentials_exception

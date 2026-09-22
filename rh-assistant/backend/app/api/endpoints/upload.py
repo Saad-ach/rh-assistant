@@ -1,31 +1,19 @@
-from fastapi import APIRouter, File, UploadFile, Depends, HTTPException
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 from sqlalchemy.orm import Session
 import docx
-import PyPDF2
+import hashlib
 import io
+import PyPDF2
+
+from app.core.config import settings
 from app.database import get_db
-from app.models import schemas, models
-from app.core.config import settings # Import settings
-from app.ml.embeddings import EmbeddingsGenerator
-from app.services import hr_service
-from app.ml.vectorizer import chroma_vectorizer
-import uuid
+from app.models import models, schemas
+from app.services.document_index import index_document
+from app.services.document_storage import document_storage
 from .chat import get_current_user
-from fastapi import status
 
 router = APIRouter()
 
-async def extract_text_from_pdf(file: UploadFile) -> str:
-    pdf_reader = PyPDF2.PdfReader(io.BytesIO(await file.read()))
-    text = ""
-    for page in pdf_reader.pages:
-        text += page.extract_text()
-    return text
-
-async def extract_text_from_docx(file: UploadFile) -> str:
-    document = docx.Document(io.BytesIO(await file.read()))
-    text = "\n".join([paragraph.text for paragraph in document.paragraphs])
-    return text
 
 @router.post("/documents")
 async def upload_document(
@@ -34,41 +22,63 @@ async def upload_document(
     db: Session = Depends(get_db),
     current_user: schemas.User = Depends(get_current_user),
 ):
-    # For simplicity, only admin can upload documents
-    if current_user.role != "admin":
+    if (
+        getattr(current_user, "role", "user") != "admin"
+        and getattr(current_user, "email", "") not in {"admin", "admin@example.com", "admin@eubia.de"}
+    ):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not enough permissions")
 
-    # Avoid reading the file twice; branch by extension and read once
-    file_extension = (file.filename or "").split(".")[-1].lower()
-    extracted_text = ""
+    file_extension = (file.filename or "").rsplit(".", 1)[-1].lower()
+    file_bytes = await file.read()
 
     if file_extension == "pdf":
-        extracted_text = await extract_text_from_pdf(file)
-    elif file_extension in ["doc", "docx"]:
-        extracted_text = await extract_text_from_docx(file)
+        reader = PyPDF2.PdfReader(io.BytesIO(file_bytes))
+        extracted_text = "\n".join(page.extract_text() or "" for page in reader.pages)
+    elif file_extension in {"doc", "docx"}:
+        document = docx.Document(io.BytesIO(file_bytes))
+        extracted_text = "\n".join(paragraph.text for paragraph in document.paragraphs)
     else:
-        raise HTTPException(status_code=400, detail="Unsupported file type. Only PDF and DOCX are supported.")
+        raise HTTPException(status_code=400, detail="Only PDF and DOCX documents are supported")
 
-    # Store in vector DB regardless of relational DB availability
-    doc_id = str(uuid.uuid4())
-    chroma_vectorizer.add_document(
-        doc_id,
+    if not extracted_text.strip():
+        raise HTTPException(status_code=422, detail="The document contains no extractable text")
+
+    content_hash = hashlib.sha256(file_bytes).hexdigest()
+    blob_name = f"{category}/{content_hash}.{file_extension}"
+    try:
+        file_path = document_storage.save(blob_name, file_bytes, file.content_type)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    document = models.DocumentRecord(
+        filename=file.filename or blob_name,
+        category=category,
+        language=settings.APP_DEFAULT_LANGUAGE,
+        blob_name=blob_name,
+        content_hash=content_hash,
+        extracted_text=extracted_text,
+        source=file_path,
+        status="indexed",
+        uploaded_by=getattr(current_user, "email", "admin"),
+    )
+    db.add(document)
+    db.commit()
+    db.refresh(document)
+
+    await index_document(
+        str(document.id),
         extracted_text,
-        {"source": f"upload_by_{current_user.email}", "filename": file.filename, "file_type": file_extension, "category": category}
+        {
+            "source": file_path,
+            "filename": document.filename,
+            "category": category,
+            "language": document.language,
+        },
     )
 
-    # Optionally persist metadata in relational DB (best-effort)
-    # Best effort DB write disabled in dev mode if tables missing
-    try:
-        hr_document = schemas.HRDocument(
-            title=file.filename,
-            content=extracted_text,
-            source=f"upload_by_{current_user.email}",
-            category=category,
-            metadata={"filename": file.filename, "file_type": file_extension},
-        )
-        hr_service.create_hr_document(db, hr_document)
-    except Exception:
-        ...
-
-    return {"filename": file.filename, "message": "Document uploaded and processed successfully", "document_id": doc_id}
+    return {
+        "filename": document.filename,
+        "message": "Document uploaded, stored and indexed successfully",
+        "document_id": document.id,
+        "storage": file_path,
+    }

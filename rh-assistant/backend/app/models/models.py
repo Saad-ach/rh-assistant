@@ -126,6 +126,42 @@ class HRDocument(Base):
     updated_by = Column(String(100))
 
 
+class DocumentRecord(Base):
+    """Document catalogue used by the EUBIA cloud document workflow."""
+
+    __tablename__ = "document_records"
+
+    id = Column(Integer, primary_key=True, index=True)
+    filename = Column(String(255), nullable=False)
+    category = Column(String(100), nullable=False, index=True)
+    language = Column(String(10), nullable=False, default="de")
+    blob_name = Column(String(500), nullable=False, unique=True)
+    content_hash = Column(String(64), nullable=False, unique=True)
+    extracted_text = Column(Text, nullable=False)
+    source = Column(String(255), nullable=False)
+    status = Column(String(30), nullable=False, default="indexed")
+    uploaded_by = Column(String(255), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now(), server_default=func.now())
+
+
+class HRQuestion(Base):
+    """Questions that require an administrator answer before being learned."""
+
+    __tablename__ = "hr_questions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    question = Column(Text, nullable=False)
+    proposed_response = Column(Text, nullable=False)
+    confidence_score = Column(Float, nullable=False, default=0.0)
+    answer = Column(Text)
+    status = Column(String(30), nullable=False, default="pending", index=True)
+    asked_by = Column(String(255), nullable=False)
+    answered_by = Column(String(255))
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    answered_at = Column(DateTime(timezone=True))
+
+
 class PerformanceMetric(Base):
     __tablename__ = "performance_metrics"
     metric_id = Column(Integer, primary_key=True, index=True)

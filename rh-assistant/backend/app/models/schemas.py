@@ -55,6 +55,33 @@ class HRDocument(BaseModel):
     metadata: dict
 
 
+class DocumentRecordResponse(BaseModel):
+    id: int
+    filename: str
+    category: str
+    language: str
+    source: str
+    status: str
+    uploaded_by: str
+    created_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class HRQuestionResponse(BaseModel):
+    id: int
+    query: str
+    proposed_response: str
+    confidence_score: float
+    hr_feedback: Optional[str] = None
+    approved: Optional[bool] = None
+    status: str
+
+    class Config:
+        from_attributes = True
+
+
 class HRValidation(BaseModel):
     query: str
     proposed_response: str

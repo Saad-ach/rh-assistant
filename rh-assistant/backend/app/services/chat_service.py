@@ -1,225 +1,233 @@
-import asyncio
 from datetime import datetime
-from typing import List, Optional, Dict
-import json
-import random
+from typing import Any
 
+from app.ml.llm_engine import LLM_UNAVAILABLE, llm_engine
+from app.services.document_index import search_documents
 from app.core.config import settings
-from app.data.cdg_data import search_cdg_content, get_cdg_knowledge_base
-from app.services.external_api import external_api_service
-from loguru import logger
+import re
+import unicodedata
+
+
+_STOP_WORDS = {
+    "avec", "dans", "des", "les", "une", "pour", "que", "qui", "sur", "aux",
+    "du", "de", "la", "le", "et", "est", "sont", "comment", "quelle", "quelles",
+    "quel", "quels", "ein", "eine", "einer", "der", "die", "das", "und", "für",
+    "mit", "von", "wie", "was", "sind", "où", "ou", "puis", "peux", "peut",
+    "trouver", "find", "where", "company", "entreprise",
+}
+
+_TOPIC_ALIASES = {
+    "reglement_interieur": (
+        "reglement", "règlement", "interieur", "intérieur", "house rules",
+        "betriebsordnung", "ordnung",
+    ),
+    "conges": (
+        "conge", "congé", "conges", "congés", "vacances", "urlaub",
+        "leave", "absence",
+    ),
+    "frais": (
+        "frais", "remboursement", "depense", "dépense", "deplacement",
+        "déplacement", "rembourse", "expense", "reimbursement",
+    ),
+    "formation": (
+        "formation", "training", "kurs", "schulung", "apprentissage",
+    ),
+    "teletravail": (
+        "teletravail", "télétravail", "travail", "distance", "remote",
+        "hybride", "mobile arbeit",
+    ),
+    "paie": (
+        "paie", "salaire", "remuneration", "rémunération", "bulletin",
+        "paye", "gehalt", "lohn", "payroll",
+    ),
+}
+
+
+def _terms(value: str) -> set[str]:
+    normalized = _normalize(value)
+    return {
+        term[:8]
+        for term in re.findall(r"[A-Za-z]{4,}", normalized)
+        if term not in _STOP_WORDS
+    }
+
+def _normalize(value: str) -> str:
+    # Some legacy Chroma entries contain replacement characters where an
+    # accented letter was decoded incorrectly; map them before comparison.
+    value = value.replace("\ufffd", "e")
+    value = re.sub(r"(?<=[a-z])\?(?=[a-z])", "e", value.lower())
+    normalized = unicodedata.normalize("NFKD", value.lower())
+    return "".join(char for char in normalized if not unicodedata.combining(char))
+
+
+def _is_relevant(query: str, document: str, distance: float) -> bool:
+    lexical_score = _lexical_score(query, document)
+    topic_score = _topic_score(query, document)
+    minimum_matches = 2 if len(_terms(query)) >= 2 else 1
+    return lexical_score >= minimum_matches or (topic_score > 0 and lexical_score >= 1)
+
+
+def _lexical_score(query: str, document: str) -> int:
+    query_terms = _terms(query)
+    document_terms = _terms(document)
+    return sum(
+        1 for query_term in query_terms
+        if any(document_term.startswith(query_term[:4]) or query_term.startswith(document_term[:4])
+               for document_term in document_terms)
+    )
+
+
+def _topic_score(query: str, document: str) -> int:
+    normalized_query = _normalize(query)
+    normalized_document = _normalize(document)
+    score = 0
+    for aliases in _TOPIC_ALIASES.values():
+        query_has_topic = any(_normalize(alias) in normalized_query for alias in aliases)
+        document_has_topic = any(_normalize(alias) in normalized_document for alias in aliases)
+        if query_has_topic and document_has_topic:
+            score += 1
+    return score
+
+
+def _topic_excerpt(query: str, document: str) -> str:
+    """Return the section matching the question instead of the whole corpus."""
+    normalized_query = _normalize(query)
+    sections = [section.strip() for section in re.split(r"\n\s*\n", document) if section.strip()]
+    matching_sections = []
+    for section in sections:
+        normalized_section = _normalize(section)
+        score = sum(
+            1
+            for aliases in _TOPIC_ALIASES.values()
+            for alias in aliases
+            if _normalize(alias) in normalized_query and _normalize(alias) in normalized_section
+        )
+        if score:
+            matching_sections.append((score, section))
+    if matching_sections:
+        return max(matching_sections, key=lambda item: item[0])[1]
+    return document
+
+
+def _confidence_score(query: str, documents: list[str], distances: list[float]) -> float:
+    """Estimate answer reliability from retrieval evidence, not document count."""
+    if not documents:
+        return 0.0
+    query_terms = _terms(query)
+    best_document = documents[0]
+    lexical_coverage = (
+        _lexical_score(query, best_document) / max(len(query_terms), 1)
+    )
+    topic_signal = min(_topic_score(query, best_document) / 2, 1.0)
+    distance = distances[0] if distances else settings.DOCUMENT_RELEVANCE_DISTANCE
+    semantic_signal = max(
+        0.0,
+        1.0 - (float(distance) / max(settings.DOCUMENT_RELEVANCE_DISTANCE, 1.0)),
+    )
+    corroboration = min((len(documents) - 1) / 3, 1.0)
+    score = (
+        0.45 * min(lexical_coverage, 1.0)
+        + 0.25 * topic_signal
+        + 0.20 * semantic_signal
+        + 0.10 * corroboration
+    )
+    return round(min(max(score, 0.0), 0.98), 2)
+
 
 class ChatService:
-    def __init__(self):
-        self.cdg_kb = get_cdg_knowledge_base()
-        self._memory_cache: Dict[str, str] = {}
+    def __init__(self) -> None:
+        self._memory_cache: dict[str, dict[str, Any]] = {}
 
-    async def get_cached_response(self, session_id: str, message: str) -> Optional[dict]:
-        cache_key = f"chat:{session_id}:{message}"
-        return self._memory_cache.get(cache_key)
+    async def process_chat_query(self, db, chat_query) -> dict[str, Any]:
+        started_at = datetime.now()
+        # Bump the cache namespace when relevance rules change so an old
+        # out-of-context answer cannot be reused.
+        cache_key = f"relevance-v4:{chat_query.session_id}:{chat_query.message}"
+        if cache_key in self._memory_cache:
+            return self._memory_cache[cache_key]
 
-    async def set_cached_response(self, session_id: str, message: str, response: dict):
-        cache_key = f"chat:{session_id}:{message}"
-        self._memory_cache[cache_key] = response
-
-    async def process_chat_query(self, db, chat_query) -> dict:
-        start_time = datetime.now()
-        
-        # Vérifier le cache
-        cached_response = await self.get_cached_response(chat_query.session_id, chat_query.message)
-        if cached_response:
-            return cached_response
-
-        # 1. Recherche dans les données CDG
-        cdg_results = search_cdg_content(chat_query.message)
-        
-        # 2. Contexte externe (météo, jours fériés, etc.)
-        external_context = await external_api_service.get_hr_context(chat_query.message)
-        
-        # 3. Générer une réponse enrichie
-        response_data = await self._generate_rich_response(
-            chat_query.message, 
-            cdg_results, 
-            external_context
+        # Search the complete demo corpus so a relevant FAQ is not hidden by
+        # semantically similar but incorrect documents.
+        search_results = search_documents(chat_query.message, n_results=20)
+        candidates = search_results.get("documents", [[]])[0]
+        metadatas = search_results.get("metadatas", [[]])[0]
+        distances = search_results.get("distances", [[]])[0]
+        relevant_indexes = [
+            index
+            for index, distance in enumerate(distances)
+            if _is_relevant(chat_query.message, candidates[index], distance)
+        ]
+        relevant_indexes.sort(
+            key=lambda index: (
+                _topic_score(chat_query.message, candidates[index]),
+                _lexical_score(chat_query.message, candidates[index]),
+                -distances[index],
+            ),
+            reverse=True,
         )
-        
-        # 4. Calculer le score de confiance
-        confidence_score = self._calculate_confidence_score(response_data, cdg_results)
-        
-        # 5. Construire la réponse finale
-        end_time = datetime.now()
-        response_time = (end_time - start_time).total_seconds()
-        
-        chat_response = {
-            "response": response_data["response"],
+        documents = [candidates[index] for index in relevant_indexes]
+        metadatas = [metadatas[index] for index in relevant_indexes]
+        relevant_distances = [distances[index] for index in relevant_indexes]
+        context_parts = []
+        sources = []
+
+        for index, document in enumerate(documents):
+            metadata = metadatas[index] if index < len(metadatas) else {}
+            source = metadata.get("filename") or metadata.get("source", "EUBIA HR document")
+            context_parts.append(f"[{source}]\n{_topic_excerpt(chat_query.message, document)}")
+            sources.append(source)
+
+        context = "\n\n".join(context_parts)
+        prompt = (
+            f"Question: {chat_query.message}\n\n"
+            f"Documents RH EUBIA disponibles:\n{context or 'Aucun document pertinent trouvé.'}\n\n"
+            "Réponds de façon concise, opérationnelle et bilingue si nécessaire. "
+            "Cite les noms des documents utilisés. Ne crée jamais une règle RH absente des documents."
+        )
+        if documents:
+            response = await llm_engine.get_completion(prompt)
+            if response.startswith(LLM_UNAVAILABLE):
+                response = (
+                    "Voici l'information trouvée dans la base documentaire EUBIA :\n\n"
+                    f"{_topic_excerpt(chat_query.message, documents[0])}"
+                )
+        else:
+            response = (
+                "Je ne trouve pas encore de réponse fiable à cette question dans "
+                "la base documentaire EUBIA. Votre demande a été transmise à "
+                "l'administrateur RH pour validation."
+            )
+        elapsed = (datetime.now() - started_at).total_seconds()
+        requires_validation = len(documents) == 0
+        if requires_validation:
+            from app.models import models
+
+            db.add(
+                models.HRQuestion(
+                    question=chat_query.message,
+                    proposed_response=response,
+                    confidence_score=0.0,
+                    status="pending",
+                    asked_by=str(chat_query.user_id),
+                )
+            )
+            db.commit()
+        confidence_score = _confidence_score(
+            chat_query.message,
+            documents,
+            relevant_distances,
+        )
+        result = {
+            "response": response,
             "confidence_score": confidence_score,
-            "sources": response_data["sources"],
-            "requires_validation": False,  # Pas de validation pour l'instant
-            "validation_status": "not_required",
-            "response_time": response_time,
-            "timestamp": datetime.now().isoformat(),
-            "additional_info": response_data.get("additional_info", {})
-        }
-        
-        # Mettre en cache
-        await self.set_cached_response(chat_query.session_id, chat_query.message, chat_response)
-        return chat_response
-
-    async def _generate_rich_response(self, query: str, cdg_results: List, external_context: dict) -> dict:
-        """Génère une réponse enrichie basée sur les données CDG et le contexte externe"""
-        
-        # Réponse de base
-        if cdg_results:
-            best_result = max(cdg_results, key=lambda x: x["relevance"])
-            if best_result["type"] == "faq":
-                base_response = best_result["content"]["answer"]
-                sources = [f"CDG FAQ - {best_result['content']['category']}"]
-            else:
-                base_response = f"Selon la politique CDG '{best_result['content']['title']}':\n{best_result['content']['content'][:300]}..."
-                sources = [f"CDG Policy - {best_result['content']['category']}"]
-        else:
-            # Réponse générique enrichie
-            base_response = self._get_generic_hr_response(query)
-            sources = ["Base de connaissances CDG"]
-        
-        # Enrichir avec le contexte externe
-        additional_info = {}
-        enriched_response = base_response
-        
-        if external_context:
-            if "weather" in external_context:
-                weather_info = external_context["weather"]
-                additional_info["weather"] = weather_info
-                if "congé" in query.lower() or "événement" in query.lower():
-                    enriched_response += f"\n\n💡 **Conseil météo** : {weather_info['city']} - {weather_info['description']} ({weather_info['temperature']}°C)"
-            
-            if "holidays" in external_context:
-                upcoming_holidays = [h for h in external_context["holidays"] if h['date'] >= datetime.now().strftime('%Y-%m-%d')][:3]
-                if upcoming_holidays:
-                    additional_info["holidays"] = upcoming_holidays
-                    if "congé" in query.lower() or "jour férié" in query.lower():
-                        enriched_response += f"\n\n📅 **Prochains jours fériés** : " + ", ".join([f"{h['name']} ({h['date']})" for h in upcoming_holidays])
-            
-            if "currency" in external_context:
-                currency_info = external_context["currency"]
-                additional_info["currency"] = currency_info
-                if "salaire" in query.lower() or "pension" in query.lower():
-                    enriched_response += f"\n\n💱 **Taux de change MAD** : EUR={currency_info['rates']['EUR']}, USD={currency_info['rates']['USD']}"
-        
-        # Ajouter des conseils contextuels
-        enriched_response += self._add_contextual_tips(query, cdg_results)
-        
-        return {
-            "response": enriched_response,
             "sources": sources,
-            "additional_info": additional_info
+            "requires_validation": requires_validation,
+            "validation_status": "pending" if requires_validation else "not_required",
+            "response_time": elapsed,
+            "timestamp": datetime.now(),
         }
+        self._memory_cache[cache_key] = result
+        return result
 
-    def _get_generic_hr_response(self, query: str) -> str:
-        """Génère une réponse générique basée sur le type de question"""
-        query_lower = query.lower()
-        
-        if any(word in query_lower for word in ["congé", "vacance", "repos"]):
-            return """**Gestion des congés à la CDG :**
-            
-📋 **Types de congés disponibles :**
-• Congés annuels : 30 jours ouvrables par an
-• Congés de maladie : selon certificat médical
-• Congés de maternité : 14 semaines
-• Congés exceptionnels : mariage, décès, etc.
-
-⏰ **Procédure de demande :**
-1. Remplir le formulaire de demande
-2. Obtenir l'accord du supérieur hiérarchique
-3. Soumettre au service RH
-4. Confirmation sous 48h
-
-💡 **Conseil** : Planifiez vos congés au moins 15 jours à l'avance pour les périodes de pointe."""
-        
-        elif any(word in query_lower for word in ["salaire", "rémunération", "paie"]):
-            return """**Rémunération et salaires à la CDG :**
-            
-💰 **Composantes du salaire :**
-• Salaire de base
-• Indemnités de résidence
-• Primes de rendement
-• Indemnités de fonction
-
-📊 **Calcul des cotisations :**
-• Employé : 14% du salaire brut
-• Employeur : 28% du salaire brut
-• Total : 42% du salaire brut
-
-📅 **Versement :** Le 25 de chaque mois
-💳 **Mode de paiement :** Virement bancaire obligatoire"""
-        
-        elif any(word in query_lower for word in ["formation", "apprentissage", "développement"]):
-            return """**Formation et développement professionnel :**
-            
-🎓 **Types de formations disponibles :**
-• Formations techniques et métier
-• Formations en management
-• Formations en langues
-• Certifications professionnelles
-
-📝 **Processus de demande :**
-1. Identifier le besoin de formation
-2. Discuter avec votre manager
-3. Soumettre la demande via l'intranet
-4. Validation par le service formation
-5. Planification et participation
-
-💡 **Budget annuel :** 3% de la masse salariale dédié à la formation"""
-        
-        else:
-            return """**Assistant RH CDG Maroc**
-            
-Je suis là pour vous aider avec toutes vos questions RH. Voici quelques sujets sur lesquels je peux vous informer :
-
-📋 **Congés et absences**
-💰 **Salaires et rémunération**
-🎓 **Formation et développement**
-🏥 **Santé et sécurité**
-📊 **Retraite et pension**
-📝 **Procédures administratives**
-
-N'hésitez pas à me poser des questions spécifiques !"""
-
-    def _add_contextual_tips(self, query: str, cdg_results: List) -> str:
-        """Ajoute des conseils contextuels basés sur la question"""
-        query_lower = query.lower()
-        tips = []
-        
-        if "congé" in query_lower:
-            tips.append("💡 **Conseil** : Consultez le calendrier des jours fériés pour optimiser vos congés.")
-        
-        if "salaire" in query_lower:
-            tips.append("💡 **Conseil** : Vérifiez votre bulletin de paie mensuel pour contrôler vos cotisations.")
-        
-        if "formation" in query_lower:
-            tips.append("💡 **Conseil** : Planifiez vos formations en début d'année pour optimiser votre budget.")
-        
-        if "retraite" in query_lower:
-            tips.append("💡 **Conseil** : Demandez votre relevé de carrière annuellement pour vérifier vos droits.")
-        
-        if not tips:
-            tips.append("💡 **Conseil** : Consultez régulièrement l'intranet CDG pour les dernières actualités RH.")
-        
-        return "\n\n" + "\n".join(tips)
-
-    def _calculate_confidence_score(self, response_data: dict, cdg_results: List) -> float:
-        """Calcule un score de confiance réaliste"""
-        if cdg_results:
-            # Score basé sur la pertinence des résultats CDG
-            return max(result["relevance"] for result in cdg_results)
-        
-        # Score basé sur la qualité de la réponse
-        response = response_data["response"]
-        if len(response) > 200:
-            return 0.85
-        elif len(response) > 100:
-            return 0.75
-        else:
-            return 0.65
 
 chat_service = ChatService()

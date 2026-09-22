@@ -21,47 +21,64 @@ async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = De
         detail="Could not validate credentials",
         headers={"WWW-Authenticate": "Bearer"},
     )
-    # Be tolerant in dev: if token invalid (e.g., reload changed SECRET_KEY), fall back to mock user
-    try:
-        payload = verify_token(token, credentials_exception)
-        email: str = payload.get("sub")
-        if email is None:
-            raise credentials_exception
-    except Exception:
-        email = "dev@example.com"
+    payload = verify_token(token, credentials_exception)
+    email: str = payload.get("sub")
+    if email is None:
+        raise credentials_exception
 
-    try:
-        user = db.query(models.User).filter(models.User.email == email).first()
-        if user is None:
-            # Dev fallback: return mock user when DB has no data
-            return SimpleNamespace(id=1, email=email, full_name="Dev User", is_active=True, role="user")
-        return user
-    except Exception:
-        # Dev fallback: if DB is unavailable or tables missing
-        return SimpleNamespace(id=1, email=email, full_name="Dev User", is_active=True, role="user")
+    user = db.query(models.User).filter(models.User.email == email).first()
+    if user is None:
+        if settings.DEMO_AUTH_ENABLED and email in {"admin", "user"}:
+            return SimpleNamespace(
+                id=1,
+                email=email,
+                full_name="Administrateur EUBIA" if email == "admin" else "Utilisateur EUBIA",
+                is_active=True,
+                role="admin" if email == "admin" else "user",
+            )
+        raise credentials_exception
+    if not user.is_active:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="User account is inactive")
+    return user
 
 
 @router.post("/token", response_model=schemas.Token)
 async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
-    try:
-        user = db.query(models.User).filter(models.User.email == form_data.username).first()
-        if not user or not verify_password(form_data.password, user.hashed_password):
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Incorrect username or password",
-                headers={"WWW-Authenticate": "Bearer"},
-            )
+    username = (form_data.username or "").strip().lower()
+    password = form_data.password or ""
+
+    user = db.query(models.User).filter(models.User.email == username).first()
+    role = "user"
+    user_id = None
+    if user:
+        valid = user.is_active and verify_password(password, user.hashed_password)
+        if not valid:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Incorrect username or password", headers={"WWW-Authenticate": "Bearer"})
         subject_email = user.email
-    except Exception:
-        # Dev fallback: issue a token for any provided username
-        subject_email = form_data.username
+        role = user.role
+        user_id = user.id
+    elif settings.DEMO_AUTH_ENABLED and (
+        (username == "admin" and password == "admin123")
+        or (username == "user" and password == "user123")
+        or (username in {"admin@example.com", "admin@eubia.de"} and password == "admin123")
+    ):
+        subject_email = "admin" if username.startswith("admin") else "user"
+        role = "admin" if subject_email == "admin" else "user"
+        user_id = 1
+    else:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Incorrect username or password", headers={"WWW-Authenticate": "Bearer"})
 
     access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES) # type: ignore
     access_token = create_access_token(
-        data={"sub": subject_email},
+        data={"sub": subject_email, "role": role, "user_id": user_id, "type": "access"},
         expires_delta=access_token_expires
     )
     return {"access_token": access_token, "token_type": "bearer"}
+
+
+@router.get("/me", response_model=schemas.User)
+async def get_current_user_profile(current_user: schemas.User = Depends(get_current_user)):
+    return current_user
 
 
 @router.post("/", response_model=schemas.ChatResponse)
